@@ -55,3 +55,8 @@ func DetailedGetPodsForMove(nodeInfo *schedulercache.NodeInfo, skipNodesWithSyst
 		client,
 		minReplicaCount)
 }
+
+// DefaultDetailedGetPodsForMove calls DetailedGetPodsForMove with the default configuration settings
+func DefaultDetailedGetPodsForMove(nodeInfo *schedulercache.NodeInfo, client *unversionedclient.Client) ([]*api.Pod, error) {
+	return DetailedGetPodsForMove(nodeInfo, *skipNodesWithSystemPods, *skipNodesWithLocalStorage, client, int32(*minReplicaCount))
+}

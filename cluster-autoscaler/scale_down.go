@@ -24,6 +24,7 @@ import (
 
 	"k8s.io/contrib/cluster-autoscaler/cloudprovider"
 	"k8s.io/contrib/cluster-autoscaler/simulator"
+	"k8s.io/contrib/cluster-autoscaler/utils/drain"
 	kube_api "k8s.io/kubernetes/pkg/api"
 	kube_record "k8s.io/kubernetes/pkg/client/record"
 	kube_client "k8s.io/kubernetes/pkg/client/unversioned"
@@ -44,6 +45,9 @@ const (
 	ScaleDownNoNodeDeleted ScaleDownResult = iota
 	// ScaleDownNodeDeleted - a node was deleted.
 	ScaleDownNodeDeleted ScaleDownResult = iota
+
+	// Name of the annotation we add to nodes that we are in the process of draining
+	DrainAnnotationName = "kubernetes.io/cluster-autoscaler-draining"
 )
 
 // FindUnneededNodes calculates which nodes are not needed, i.e. all pods can be scheduled somewhere else,
@@ -125,6 +129,7 @@ func ScaleDown(
 
 	now := time.Now()
 	candidates := make([]*kube_api.Node, 0)
+	var toRemove simulator.NodeToBeRemoved
 	for _, node := range nodes {
 		if val, found := unneededNodes[node.Name]; found {
 
@@ -157,6 +162,11 @@ func ScaleDown(
 			}
 
 			candidates = append(candidates, node)
+
+			// If a node is marked for draining, remember it
+			if _, ok := node.Annotations[DrainAnnotationName]; ok {
+				toRemove.Node = node
+			}
 		}
 	}
 	if len(candidates) == 0 {
@@ -190,32 +200,83 @@ func ScaleDown(
 		return ScaleDownError, fmt.Errorf("failed to delete at least one empty node: %v", finalError)
 	}
 
-	// We look for only 1 node so new hints may be incomplete.
-	nodesToRemove, _, err := simulator.FindNodesToRemove(candidates, nodes, pods, client, predicateChecker, 1, false,
-		oldHints, usageTracker, time.Now())
+	if toRemove.Node == nil {
+		// We look for only 1 node so new hints may be incomplete.
+		nodesToRemove, _, err := simulator.FindNodesToRemove(candidates, nodes, pods, client, predicateChecker, 1, false,
+			oldHints, usageTracker, time.Now())
 
-	if err != nil {
-		return ScaleDownError, fmt.Errorf("Find node to remove failed: %v", err)
+		if err != nil {
+			return ScaleDownError, fmt.Errorf("Find node to remove failed: %v", err)
+		}
+		if len(nodesToRemove) == 0 {
+			glog.V(1).Infof("No node to remove")
+			return ScaleDownNoNodeDeleted, nil
+		}
+
+		// Update the node to add our drain mark, and make it unschedulable
+		toRemove = nodesToRemove[0]
+		toRemove.Node.Annotations[DrainAnnotationName] = "true"
+		toRemove.Node.Spec.Unschedulable = true
+		toRemove.Node, err = client.Nodes().Update(toRemove.Node)
+		if err != nil {
+			return ScaleDownError, fmt.Errorf("Error marking node for draining: %v", err)
+		}
+	} else {
+		// Refresh the list of pods to reschedule
+		nodeNameToNodeInfo := schedulercache.CreateNodeNameToInfoMap(pods)
+		nodeInfo := nodeNameToNodeInfo[toRemove.Node.Name]
+		if nodeInfo == nil {
+			return ScaleDownError, fmt.Errorf("Error draining node: Failed to get NodeInfo for %s", toRemove.Node.Name)
+		}
+		var err error
+		toRemove.PodsToReschedule, err = simulator.DefaultDetailedGetPodsForMove(nodeInfo, client)
+		if err != nil {
+			// TODO: This could be a persistent error, e.g. if a un-movable pod starts on the node just before we're able to mark the node as unschedulable
+			// However we also get errors here for temporary problems (communications failure, replica sets which are below min threshold, etc.)
+			// So we need to be able to differentiate between the two error types so that we know whether we should be trying again later or aborting the entire downscale
+			return ScaleDownError, fmt.Errorf("Error getting list of pods to reschedule (node %s): %v", toRemove.Node.Name, err)
+		}
 	}
-	if len(nodesToRemove) == 0 {
-		glog.V(1).Infof("No node to remove")
-		return ScaleDownNoNodeDeleted, nil
-	}
-	toRemove := nodesToRemove[0]
+
 	utilization := lastUtilizationMap[toRemove.Node.Name]
 	podNames := make([]string, 0, len(toRemove.PodsToReschedule))
 	for _, pod := range toRemove.PodsToReschedule {
 		podNames = append(podNames, pod.Namespace+"/"+pod.Name)
 	}
-	glog.V(0).Infof("Scale-down: removing node %s, utilization: %v, pods to reschedule: ", toRemove.Node.Name, utilization,
+	glog.V(0).Infof("Scale-down: removing node %s, utilization: %v, pods to reschedule: %s", toRemove.Node.Name, utilization,
 		strings.Join(podNames, ","))
 
-	simulator.RemoveNodeFromTracker(usageTracker, toRemove.Node.Name, unneededNodes)
-	err = deleteNodeFromCloudProvider(toRemove.Node, cloudProvider, recorder)
-	if err != nil {
-		return ScaleDownError, fmt.Errorf("Failed to delete %s: %v", toRemove.Node.Name, err)
+	// Group pods by replica set and terminate one pod from each set
+	// This will avoid any sudden load changes, giving the replica set enough time to start replacement pods
+	replicaSets := map[string][]*kube_api.Pod{}
+	for _, pod := range toRemove.PodsToReschedule {
+		rs, _ := drain.CreatorRef(pod) // Shouldn't fail, all it does is decode an annotation
+		key := rs.Reference.Namespace + "/" + rs.Reference.Name
+		replicaSets[key] = append(replicaSets[key], pod)
 	}
-	return ScaleDownNodeDeleted, nil
+
+outer:
+	for rs, pods := range replicaSets {
+		// Check that none of the pods are already terminating
+		for _, pod := range pods {
+			if pod.DeletionTimestamp != nil {
+				glog.V(0).Infof("Scale-down: Ignoring replica set %s because previous pod still terminating", rs)
+				continue outer
+			}
+		}
+		// Now pick a pod and terminate it
+		pod := pods[0]
+		glog.V(0).Infof("Scale-down: Terminating pod %s (replica set %s)", pod.Name, rs)
+		err := client.Pods(pod.Namespace).Delete(pod.Name, nil)
+		if err != nil {
+			return ScaleDownError, fmt.Errorf("Error terminating pod: %v", err)
+		}
+	}
+
+	// Wait until the next cycle before doing any further work
+	// TODO: ScaleDownNoNodeDeleted result will cause the core code to wait a long time before calling us again.
+	// Will cause node terminations to drag on for longer than necessary (especially if lots of pods from one replica are running)
+	return ScaleDownNoNodeDeleted, nil
 }
 
 // This functions finds empty nodes among passed candidates and returns a list of empty nodes
